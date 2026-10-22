@@ -1,6 +1,17 @@
--- Verified StoneBlock 4 v1.23.0 examples. Extend with additional recipes.
--- Each ingredient is a registry item ID; tag alternatives are not supported.
+
+-- StoneBlock 4 Ars Nouveau recipes
+-- ME Source Cell Housing
+
 return {
-  { output='ars_nouveau:arcanist_boots', reagent='minecraft:iron_boots', ingredients={['ars_nouveau:magebloom_fiber']=4} },
-  { output='ars_nouveau:arcanist_robes', reagent='minecraft:iron_chestplate', ingredients={['ars_nouveau:magebloom_fiber']=4} },
+  {
+    output = "arseng:source_cell_housing",
+
+    reagent = "ae2:item_cell_housing",
+
+    ingredients = {
+      ["ars_nouveau:manipulation_essence"] = 2,
+      ["ars_nouveau:source_gem"] = 2,
+      ["minecraft:gold_ingot"] = 4
+    }
+  }
 }
