@@ -1,98 +1,132 @@
--- StoneBlock 4 Ars Nouveau Enchanting Apparatus controller
--- EXPERIMENTAL: requires CC inventory peripheral exposure for apparatus/pedestals.
--- Connect exactly 8 pedestals, input chest, output chest and apparatus with wired modems.
--- Input must receive one complete AE2 pattern at a time (blocking mode).
--- For output, connect an AE2 Import Bus to the output chest.
-local config = {
-  input = 'minecraft:chest_0',
-  output = 'minecraft:chest_1',
-  apparatus = 'ars_nouveau:enchanting_apparatus_0',
-  timeoutSeconds = 90,
-}
-local recipes = dofile('recipes.lua')
-local function inv(name)
-  local p = peripheral.wrap(name)
-  assert(p and type(p.list)=='function' and type(p.pushItems)=='function', 'Missing inventory peripheral: '..name)
-  return p
+-- Unified Ars Nouveau AE2 controller for CC:Tweaked
+-- One machine, one ingredient buffer and one pattern provider per network.
+-- Enchanting: FIRST OCCUPIED BUFFER SLOT is the central reagent.
+-- Requires inventory peripheral integration for the connected Ars blocks.
+
+local CFG = { poll = 0.5, timeout = 120, settle = 1.0 }
+
+local function findAll(part)
+  local found = {}
+  for _, name in ipairs(peripheral.getNames()) do
+    if name:find(part, 1, true) then found[#found+1] = name end
+  end
+  table.sort(found)
+  return found
 end
-local input, output, apparatus = inv(config.input), inv(config.output), inv(config.apparatus)
-local pedestals = {}
-for _, name in ipairs(peripheral.getNames()) do
-  if name:find('arcane_pedestal', 1, true) or name:find('arcane_platform', 1, true) then
-    inv(name)
-    pedestals[#pedestals+1] = name
+
+local function exactlyOne(part, label)
+  local names = findAll(part)
+  assert(#names == 1, label .. ': expected exactly one, found ' .. #names)
+  local p = assert(peripheral.wrap(names[1]), 'Cannot wrap ' .. names[1])
+  assert(type(p.list) == 'function' and type(p.pushItems) == 'function', label .. ' lacks inventory methods')
+  return names[1], p
+end
+
+local imbuements = findAll('ars_nouveau:imbuement_chamber')
+local enchanting = findAll('ars_nouveau:enchanting_apparatus')
+assert(#imbuements + #enchanting == 1, 'Connect exactly one Ars machine per computer network')
+local mode = #imbuements == 1 and 'imbuement' or 'enchanting'
+local machineName = mode == 'imbuement' and imbuements[1] or enchanting[1]
+local machine = assert(peripheral.wrap(machineName))
+assert(type(machine.list) == 'function' and type(machine.pushItems) == 'function', 'Machine does not expose inventory methods')
+local bufferName, buffer = exactlyOne('extendedae:ingredient_buffer', 'Ingredient Buffer')
+local ppName, provider = exactlyOne('pattern_provider', 'Pattern Provider')
+local pedNames = findAll('ars_nouveau:arcane_pedestal')
+assert(#pedNames > 0, 'No Arcane Pedestals found')
+local peds = {}
+for i, name in ipairs(pedNames) do
+  peds[i] = assert(peripheral.wrap(name))
+  assert(type(peds[i].list) == 'function' and type(peds[i].pushItems) == 'function', 'Pedestal lacks inventory methods: ' .. name)
+end
+
+local function snapshot(p) return p.list() or {} end
+local function empty(p) return next(snapshot(p)) == nil end
+local function sortedSlots(inv)
+  local slots = {}
+  for slot in pairs(inv) do slots[#slots+1] = slot end
+  table.sort(slots)
+  return slots
+end
+local function transfer(src, target, slot, qty)
+  local moved = src.pushItems(target, slot, qty)
+  assert(moved == qty, 'Transfer failed (' .. tostring(moved) .. '/' .. tostring(qty) .. ') to ' .. target)
+end
+local function unload(p)
+  for _, slot in ipairs(sortedSlots(snapshot(p))) do
+    local item = snapshot(p)[slot]
+    if item then transfer(p, ppName, slot, item.count) end
   end
 end
-table.sort(pedestals)
-assert(#pedestals == 8, 'Expected 8 pedestals, found '..#pedestals)
-local function countItems(p)
-  local counts={}
-  for _, item in pairs(p.list()) do counts[item.name]=(counts[item.name] or 0)+item.count end
-  return counts
-end
-local function slotFor(p, id)
-  for slot,item in pairs(p.list()) do if item.name==id then return slot end end
-end
-local function push(p, dest, slot, count)
-  local n=p.pushItems(dest, slot, count)
-  assert(n==count, 'Moved '..tostring(n)..'/'..count..' items to '..dest)
-end
-local function idle()
-  if next(apparatus.list()) then return false end
-  for _,name in ipairs(pedestals) do if next(inv(name).list()) then return false end end
+local function pedEmpty()
+  for _, p in ipairs(peds) do if not empty(p) then return false end end
   return true
 end
-local function recipeForInput()
-  local available=countItems(input)
-  for _,recipe in ipairs(recipes) do
-    local required={}
-    required[recipe.reagent]=1
-    for id,n in pairs(recipe.ingredients) do required[id]=(required[id] or 0)+n end
-    local ok=true
-    for id,n in pairs(required) do if available[id]~=n then ok=false end end
-    for id in pairs(available) do if not required[id] then ok=false end end
-    if ok then return recipe end
-  end
+local function clear()
+  assert(empty(machine) and pedEmpty(), 'Machine/pedestals not empty: clear manually before starting')
 end
-local function craft(recipe)
-  print('Crafting '..recipe.output)
-  local ids={}
-  for id in pairs(recipe.ingredients) do ids[#ids+1]=id end
-  table.sort(ids)
-  local index=1
-  for _,id in ipairs(ids) do
-    for _=1,recipe.ingredients[id] do
-      assert(index<=#pedestals, 'Too many ingredients')
-      local slot=assert(slotFor(input,id), 'Missing '..id)
-      push(input,pedestals[index],slot,1)
-      index=index+1
+local function load()
+  clear()
+  local items = snapshot(buffer)
+  local slots = sortedSlots(items)
+  if #slots == 0 then return nil end
+  local center = slots[1]
+  local pi = 1
+  for i = 2, #slots do
+    local slot = slots[i]
+    local qty = items[slot].count
+    -- Imbuement follows original author: each occupied slot goes to one pedestal.
+    -- Enchanting splits stacks one item per pedestal.
+    if mode == 'imbuement' then
+      assert(pi <= #peds, 'Not enough pedestals')
+      transfer(buffer, pedNames[pi], slot, qty)
+      pi = pi + 1
+    else
+      for j = 1, qty do
+        assert(pi <= #peds, 'Not enough pedestals')
+        transfer(buffer, pedNames[pi], slot, 1)
+        pi = pi + 1
+      end
     end
   end
-  sleep(0.5)
-  push(input,config.apparatus,assert(slotFor(input,recipe.reagent)),1)
-  local deadline=os.epoch('utc')+config.timeoutSeconds*1000
-  local resultSlot
-  repeat
-    resultSlot=slotFor(apparatus,recipe.output)
-    if resultSlot then break end
-    sleep(0.25)
-  until os.epoch('utc')>=deadline
-  assert(resultSlot, 'Timeout: no output detected. Check Source, core, and activation.')
-  push(apparatus,config.output,resultSlot,1)
-  for _,name in ipairs(pedestals) do
-    local p=inv(name)
-    for slot,item in pairs(p.list()) do push(p,config.output,slot,item.count) end
-  end
-  print('Finished '..recipe.output)
+  sleep(CFG.settle)
+  transfer(buffer, machineName, center, items[center].count)
+  return textutils.serialise(snapshot(machine))
 end
-print('Ars controller started; '..#recipes..' recipes loaded')
+
+print('Unified Ars Controller | ' .. mode)
+print('Machine: ' .. machineName)
+print('Buffer: ' .. bufferName)
+print('Provider: ' .. ppName)
+print('Pedestals: ' .. #peds)
+print('Setup OK')
+
 while true do
-  if idle() then
-    local recipe=recipeForInput()
-    if recipe then
-      local ok,err=pcall(craft,recipe)
-      if not ok then printError(err); print('HALTED to prevent item loss'); break end
+  if not empty(buffer) then
+    local ok, err = pcall(function()
+      local initial = load()
+      if not initial then return end
+      print('Crafting...')
+      local deadline = os.epoch('utc') + CFG.timeout * 1000
+      local changed = false
+      while os.epoch('utc') < deadline do
+        local now = textutils.serialise(snapshot(machine))
+        if now ~= initial and not empty(machine) then
+          changed = true
+          break
+        end
+        sleep(CFG.poll)
+      end
+      assert(changed, 'Timed out waiting for machine inventory to change')
+      sleep(CFG.settle)
+      unload(machine)
+      for _, p in ipairs(peds) do unload(p) end
+      assert(empty(machine) and pedEmpty(), 'Output or reusable ingredients remain')
+      print('Complete')
+    end)
+    if not ok then
+      printError(err)
+      error('Controller stopped; inspect inventories before restarting', 0)
     end
   end
-  sleep(0.5)
+  sleep(CFG.poll)
 end
